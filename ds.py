@@ -1,84 +1,127 @@
-import pandas as pd
+import os
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.ensemble import RandomForestClassifier
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import DenseNet121
+from tensorflow.keras import layers, models, optimizers
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
-from imblearn.over_sampling import SMOTE
 
 # ==========================================
-# 1. LOAD DATA
+# 1. CONFIGURATION & HYPERPARAMETERS
 # ==========================================
-# You can use 'Telco-Customer-Churn.csv' from Kaggle
-url = "https://raw.githubusercontent.com/IBM/telco-customer-churn-on-icp4d/master/data/Telco-Customer-Churn.csv"
-df = pd.read_csv(url)
-
-# ==========================================
-# 2. PREPROCESSING (The "Force-Numeric" Version)
-# ==========================================
-# Drop ID
-df.drop('customerID', axis=1, errors='ignore', inplace=True)
-
-# 1. Convert TotalCharges and handle NaNs
-df['TotalCharges'] = pd.to_numeric(df['TotalCharges'], errors='coerce')
-df['TotalCharges'] = df['TotalCharges'].fillna(df['TotalCharges'].median())
-
-# 2. Force the target variable 'Churn' to be 1 and 0
-# This replaces the 'No'/'Yes' strings directly
-df['Churn'] = df['Churn'].map({'No': 0, 'Yes': 1})
-
-# 3. Encode all other categorical columns
-for col in df.select_dtypes(include=['object']).columns:
-    le = LabelEncoder()
-    df[col] = le.fit_transform(df[col].astype(str))
-
-# 4. Final safety check: ensure everything is numeric
-df = df.apply(pd.to_numeric)
-
-# Split
-X = df.drop('Churn', axis=1)
-y = df['Churn']
-# ==========================================
-# 3. HANDLE IMBALANCE USING SMOTE
-# ==========================================
-print(f"Original class distribution: {np.bincount(y)}")
-
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-smote = SMOTE(random_state=42)
-X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
-
-print(f"Resampled class distribution: {np.bincount(y_train_res)}")
+# Update these paths to where your data is stored in VS Code
+# Change this line in your script:
+DATASET_DIR = r'D:\interships\codec\data\chest_xray'
+TRAIN_DIR = os.path.join(DATASET_DIR, 'train')
+VAL_DIR = os.path.join(DATASET_DIR, 'val')
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 32
+EPOCHS = 10
+LEARNING_RATE = 1e-4
 
 # ==========================================
-# 4. MODEL TRAINING (Random Forest)
+# 2. DATA PREPARATION (AUGMENTATION)
 # ==========================================
-# Using Random Forest as it builds multiple Decision Trees for better accuracy
-model = RandomForestClassifier(n_estimators=100, random_state=42)
-model.fit(X_train_res, y_train_res)
+# We use augmentation for training to make the model robust to X-ray rotations
+train_datagen = ImageDataGenerator(
+    rescale=1./255,
+    rotation_range=15,
+    width_shift_range=0.1,
+    height_shift_range=0.1,
+    shear_range=0.1,
+    zoom_range=0.2,
+    horizontal_flip=True,
+    fill_mode='nearest'
+)
+
+# Only rescaling for validation/testing
+val_datagen = ImageDataGenerator(rescale=1./255)
+
+train_generator = train_datagen.flow_from_directory(
+    TRAIN_DIR,
+    target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode='binary'
+)
+
+val_generator = val_datagen.flow_from_directory(
+    VAL_DIR,
+    target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode='binary',
+    shuffle=False
+)
 
 # ==========================================
-# 5. EVALUATION
+# 3. MODEL ARCHITECTURE (DENSENET121)
 # ==========================================
-y_pred = model.predict(X_test)
-y_prob = model.predict_proba(X_test)[:, 1]
+print("Building model using DenseNet121...")
+base_model = DenseNet121(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+base_model.trainable = False  # Freeze pre-trained weights
 
-print("\n--- Confusion Matrix ---")
-sns.heatmap(confusion_matrix(y_test, y_pred), annot=True, fmt='d', cmap='Blues')
-plt.xlabel('Predicted')
-plt.ylabel('Actual')
+model = models.Sequential([
+    base_model,
+    layers.GlobalAveragePooling2D(),
+    layers.Dense(512, activation='relu'),
+    layers.Dropout(0.5),
+    layers.Dense(1, activation='sigmoid') # Binary Output: Pneumonia (1) or Normal (0)
+])
+
+model.compile(
+    optimizer=optimizers.Adam(learning_rate=LEARNING_RATE),
+    loss='binary_crossentropy',
+    metrics=['accuracy', tf.keras.metrics.Precision(name='precision'), tf.keras.metrics.Recall(name='recall')]
+)
+
+model.summary()
+
+# ==========================================
+# 4. TRAINING
+# ==========================================
+callbacks = [
+    ModelCheckpoint('pneumonia_model.h5', save_best_only=True, monitor='val_accuracy'),
+    EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
+]
+
+print("Starting training...")
+history = model.fit(
+    train_generator,
+    epochs=EPOCHS,
+    validation_data=val_generator,
+    callbacks=callbacks
+)
+
+# ==========================================
+# 5. EVALUATION & VISUALIZATION
+# ==========================================
+# Plot Accuracy and Loss
+plt.figure(figsize=(12, 4))
+plt.subplot(1, 2, 1)
+plt.plot(history.history['accuracy'], label='Train Accuracy')
+plt.plot(history.history['val_accuracy'], label='Val Accuracy')
+plt.title('Accuracy over Epochs')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Val Loss')
+plt.title('Loss over Epochs')
+plt.legend()
 plt.show()
+
+# Predictions for Metrics
+val_generator.reset()
+predictions = model.predict(val_generator)
+y_pred = (predictions > 0.5).astype(int)
+y_true = val_generator.classes
 
 print("\n--- Classification Report ---")
-print(classification_report(y_test, y_pred))
-print(f"AUC Score: {roc_auc_score(y_test, y_prob):.4f}")
+print(classification_report(y_true, y_pred, target_names=val_generator.class_indices.keys()))
 
-# ==========================================
-# 6. FEATURE IMPORTANCE (The "Why")
-# ==========================================
-importances = pd.Series(model.feature_importances_, index=X.columns)
-importances.nlargest(10).plot(kind='barh')
-plt.title('Top 10 Factors Driving Churn')
-plt.show()
+auc = roc_auc_score(y_true, predictions)
+print(f"AUC Score: {auc:.4f}")
+
+print("\nModel saved as pneumonia_model.h5")
